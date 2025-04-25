@@ -1,6 +1,6 @@
-#define BLYNK_TEMPLATE_ID "TMPL6L87MUReb"
-#define BLYNK_TEMPLATE_NAME "FEEDandCONNECT"
-#define BLYNK_AUTH_TOKEN "dcvtcgx8l422kc7zPEPPIw2AybNKNQRx"
+#define BLYNK_TEMPLATE_ID "TMPL6xytI8GQH"
+#define BLYNK_TEMPLATE_NAME "PET FEEDER"
+#define BLYNK_AUTH_TOKEN "jNOji09kF2W8YYSWkvKZF_Gdl0WsYi8x"
 
 #include <ESP8266WiFi.h>
 #include <BlynkSimpleEsp8266.h>
@@ -45,12 +45,17 @@ const int STEPS_PER_ROTATION = 200;  // NEMA17 standard (1.8° per step)
 int feedingAmount = 50;              // Default feeding amount (steps)
 bool feedingInProgress = false;
 
-// Time-based feeding (in hours)
-int feedingInterval = 12; // Default: feed every 12 hours
+// Time-based feeding
 unsigned long lastFeedTime = 0; // Last time fed (in seconds since midnight)
 bool scheduleEnabled = true;
 unsigned long nextFeedTime = 0; // Next scheduled feed time (in seconds since midnight)
 unsigned long lastFeedTimestamp = 0; // For safety timeout between feeds
+
+// Store feeding times
+const int MAX_FEEDING_TIMES = 4;
+unsigned long scheduledFeedingTimes[MAX_FEEDING_TIMES] = {0}; // In seconds since midnight
+bool feedingTimeEnabled[MAX_FEEDING_TIMES] = {false};
+int activeScheduleCount = 0;
 
 // Track the last feeding period to prevent multiple feeds
 unsigned long lastFeedingPeriod = 0;
@@ -74,17 +79,19 @@ bool captivePortal();
 bool tryConnect();
 void loadCredentials();
 void saveCredentials();
-void calculateNextFeedTime();
+void updateNextFeedTime();
 
 // This function will be called when device connects to Blynk server
 BLYNK_CONNECTED() {
   // Synchronize time on connection
   rtc.begin();
-  Blynk.syncVirtual(V1, V3, V4); // Sync slider and time inputs
+  Blynk.syncVirtual(V1); // Sync portion size slider
+  Blynk.syncVirtual(V4); // Sync schedule enabled/disabled
+  Blynk.syncVirtual(V7, V8, V9, V10); // Sync feeding schedule times
   Serial.println("Blynk connected and RTC synced");
   
   // Calculate initial next feed time
-  calculateNextFeedTime();
+  updateNextFeedTime();
 }
 
 // Feed now button
@@ -97,9 +104,9 @@ BLYNK_WRITE(V0) {
     Serial.println("Triggering feedNow function");
     feedNow();
     
-    // Reset the feeding timer after manual feed
+    // Record the feeding time
     lastFeedTime = getCurrentTimeInSeconds();
-    calculateNextFeedTime();
+    updateNextFeedTime();
   }
 }
 
@@ -111,37 +118,97 @@ BLYNK_WRITE(V1) {
   Blynk.virtualWrite(V5, String("Portion: ") + String(param.asInt()));
 }
 
-// Set feeding interval time (V3 input)
-BLYNK_WRITE(V3) {
-  TimeInputParam t(param);
-  if (t.hasStartTime()) {
-    // Extract hours and minutes
-    int hours = t.getStartHour();
-    int minutes = t.getStartMinute();
-    
-    // Convert to total hours (with fraction for minutes)
-    feedingInterval = hours + (minutes / 60.0);
-    
-    Serial.print("Feeding interval set to: ");
-    Serial.print(hours);
-    Serial.print(" hours and ");
-    Serial.print(minutes);
-    Serial.println(" minutes");
-    
-    // Recalculate next feeding time
-    calculateNextFeedTime();
-    
-    // Update status display
-    updateStatus();
-  }
-}
-
 // Schedule enable/disable switch
 BLYNK_WRITE(V4) {
   scheduleEnabled = param.asInt();
   Serial.print("Schedule enabled: ");
   Serial.println(scheduleEnabled);
   updateStatus(); // Update status display when schedule is toggled
+}
+
+// Set scheduled feeding times (V7, V8, V9, V10 for up to 4 feeding times)
+BLYNK_WRITE(V7) {
+  TimeInputParam t(param);
+  if (t.hasStartTime()) {
+    int hours = t.getStartHour();
+    int minutes = t.getStartMinute();
+    scheduledFeedingTimes[0] = hours * 3600 + minutes * 60;
+    feedingTimeEnabled[0] = true;
+    Serial.print("Schedule 1 set to: ");
+    Serial.print(hours);
+    Serial.print(":");
+    if (minutes < 10) Serial.print("0");
+    Serial.println(minutes);
+    updateNextFeedTime();
+    updateStatus();
+  } else {
+    feedingTimeEnabled[0] = false;
+    updateNextFeedTime();
+    updateStatus();
+  }
+}
+
+BLYNK_WRITE(V8) {
+  TimeInputParam t(param);
+  if (t.hasStartTime()) {
+    int hours = t.getStartHour();
+    int minutes = t.getStartMinute();
+    scheduledFeedingTimes[1] = hours * 3600 + minutes * 60;
+    feedingTimeEnabled[1] = true;
+    Serial.print("Schedule 2 set to: ");
+    Serial.print(hours);
+    Serial.print(":");
+    if (minutes < 10) Serial.print("0");
+    Serial.println(minutes);
+    updateNextFeedTime();
+    updateStatus();
+  } else {
+    feedingTimeEnabled[1] = false;
+    updateNextFeedTime();
+    updateStatus();
+  }
+}
+
+BLYNK_WRITE(V9) {
+  TimeInputParam t(param);
+  if (t.hasStartTime()) {
+    int hours = t.getStartHour();
+    int minutes = t.getStartMinute();
+    scheduledFeedingTimes[2] = hours * 3600 + minutes * 60;
+    feedingTimeEnabled[2] = true;
+    Serial.print("Schedule 3 set to: ");
+    Serial.print(hours);
+    Serial.print(":");
+    if (minutes < 10) Serial.print("0");
+    Serial.println(minutes);
+    updateNextFeedTime();
+    updateStatus();
+  } else {
+    feedingTimeEnabled[2] = false;
+    updateNextFeedTime();
+    updateStatus();
+  }
+}
+
+BLYNK_WRITE(V10) {
+  TimeInputParam t(param);
+  if (t.hasStartTime()) {
+    int hours = t.getStartHour();
+    int minutes = t.getStartMinute();
+    scheduledFeedingTimes[3] = hours * 3600 + minutes * 60;
+    feedingTimeEnabled[3] = true;
+    Serial.print("Schedule 4 set to: ");
+    Serial.print(hours);
+    Serial.print(":");
+    if (minutes < 10) Serial.print("0");
+    Serial.println(minutes);
+    updateNextFeedTime();
+    updateStatus();
+  } else {
+    feedingTimeEnabled[3] = false;
+    updateNextFeedTime();
+    updateStatus();
+  }
 }
 
 void setup() {
@@ -221,7 +288,7 @@ void setup() {
         
         // Initialize the last feed time to current time
         lastFeedTime = getCurrentTimeInSeconds();
-        calculateNextFeedTime();
+        updateNextFeedTime();
       } else {
         Serial.println("Failed to connect to Blynk server after multiple attempts");
       }
@@ -346,41 +413,60 @@ void feedNow() {
     // Update the last feed time and calculate the next one
     lastFeedTime = getCurrentTimeInSeconds();
     lastFeedTimestamp = millis();  // Record when we last fed
-    calculateNextFeedTime();
+    updateNextFeedTime();
     updateStatus();
   } else {
     Serial.println("Feeding complete (config mode)");
   }
 }
 
-void calculateNextFeedTime() {
-  if (lastFeedTime == 0) {
-    lastFeedTime = getCurrentTimeInSeconds();
+void updateNextFeedTime() {
+  // Start by assuming no next feeding time
+  bool foundNextTime = false;
+  nextFeedTime = 0;
+  activeScheduleCount = 0;
+  
+  // Get current time
+  unsigned long currentTimeSeconds = getCurrentTimeInSeconds();
+  
+  // Find the next upcoming feeding time from our scheduled times
+  for (int i = 0; i < MAX_FEEDING_TIMES; i++) {
+    if (feedingTimeEnabled[i]) {
+      activeScheduleCount++;
+      
+      // If this schedule time is in the future today, consider it
+      if (scheduledFeedingTimes[i] > currentTimeSeconds) {
+        if (!foundNextTime || scheduledFeedingTimes[i] < nextFeedTime) {
+          nextFeedTime = scheduledFeedingTimes[i];
+          foundNextTime = true;
+        }
+      }
+    }
   }
   
-  // Calculate interval in seconds
-  unsigned long intervalSeconds = feedingInterval * 3600; // Convert hours to seconds
-  
-  // Calculate next feed time
-  nextFeedTime = lastFeedTime + intervalSeconds;
-  
-  // Handle day overflow
-  unsigned long secondsInDay = 24 * 3600;
-  if (nextFeedTime >= secondsInDay) {
-    nextFeedTime = nextFeedTime % secondsInDay;
+  // If no future feeding time found today, find the earliest one for tomorrow
+  if (!foundNextTime && activeScheduleCount > 0) {
+    nextFeedTime = 24 * 3600; // Set to maximum value (end of day)
+    
+    for (int i = 0; i < MAX_FEEDING_TIMES; i++) {
+      if (feedingTimeEnabled[i] && scheduledFeedingTimes[i] < nextFeedTime) {
+        nextFeedTime = scheduledFeedingTimes[i];
+        foundNextTime = true;
+      }
+    }
   }
   
-  Serial.print("Next feeding scheduled at: ");
-  Serial.println(formatTimeFromSeconds(nextFeedTime));
-  
-  // Also log the interval in human-readable form
-  Serial.print("Feeding interval: ");
-  Serial.print(feedingInterval);
-  Serial.println(" hours");
+  // Log the next feeding time
+  if (foundNextTime) {
+    Serial.print("Next feeding scheduled at: ");
+    Serial.println(formatTimeFromSeconds(nextFeedTime));
+  } else {
+    Serial.println("No scheduled feeding times set.");
+  }
 }
 
 void checkScheduledFeeding() {
-  if (!scheduleEnabled || feedingInProgress || configMode) {
+  if (!scheduleEnabled || feedingInProgress || configMode || activeScheduleCount == 0) {
     return;
   }
   
@@ -429,7 +515,7 @@ void checkScheduledFeeding() {
     lastFeedingPeriod = currentFeedingPeriod;
     
     // Calculate the next feeding time
-    calculateNextFeedTime();
+    updateNextFeedTime();
   }
 }
 
@@ -466,7 +552,7 @@ void updateStatus() {
   
   // Update next feeding time on V2
   String nextFeeding = "Next: ";
-  if (scheduleEnabled) {
+  if (scheduleEnabled && activeScheduleCount > 0) {
     nextFeeding += formatTimeFromSeconds(nextFeedTime);
     
     // Calculate time remaining
@@ -488,26 +574,23 @@ void updateStatus() {
       nextFeeding += String(hoursRemaining) + "h ";
     }
     nextFeeding += String(minutesRemaining) + "m)";
-  } else {
+  } else if (!scheduleEnabled) {
     nextFeeding += "Schedule OFF";
+  } else {
+    nextFeeding += "No times set";
   }
   
   // Update status widgets
   Blynk.virtualWrite(V2, nextFeeding);
   
-  // Also update V5 with current portion size
+  // Update V5 with current portion size and last fed time
   Blynk.virtualWrite(V5, String("Portion: ") + String(feedingAmount / 100) + 
                         " (Last: " + getCurrentTime() + ")");
   
-  // Also update V6 with interval info
-  int intervalHours = (int)feedingInterval;
-  int intervalMinutes = (int)((feedingInterval - intervalHours) * 60);
-  String intervalStr = "Interval: ";
-  intervalStr += String(intervalHours) + "h";
-  if (intervalMinutes > 0) {
-    intervalStr += " " + String(intervalMinutes) + "m";
-  }
-  Blynk.virtualWrite(V6, intervalStr);
+  // Update V6 with active schedule count
+  String scheduleStr = "Schedule: ";
+  scheduleStr += String(activeScheduleCount) + " active times";
+  Blynk.virtualWrite(V6, scheduleStr);
 }
 
 // SoftAP Configuration Functions
