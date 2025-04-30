@@ -22,6 +22,12 @@ bool configMode = false;
 int configTimeout = 0;
 const int CONFIG_TIMEOUT_MAX = 300; // 5 minutes timeout for config mode
 
+BlynkTimer statusUpdateTimer;  // Create a timer for batching status updates
+bool statusUpdateNeeded = false;
+String nextFeedingStatus = "";
+String lastFedStatus = "";
+String scheduleStatus = "";
+
 // DNS Server for captive portal
 DNSServer dnsServer;
 ESP8266WebServer webServer(80);
@@ -80,14 +86,15 @@ bool tryConnect();
 void loadCredentials();
 void saveCredentials();
 void updateNextFeedTime();
+void setupBatchedUpdates();
+void sendBatchedStatusUpdate();
 
 // This function will be called when device connects to Blynk server
 BLYNK_CONNECTED() {
   // Synchronize time on connection
   rtc.begin();
-  Blynk.syncVirtual(V1); // Sync portion size slider
-  Blynk.syncVirtual(V4); // Sync schedule enabled/disabled
-  Blynk.syncVirtual(V7, V8, V9, V10); // Sync feeding schedule times
+  // Perform a single sync request with multiple pins instead of individual calls
+  Blynk.syncVirtual(V1, V4, V7, V8, V9, V10); // Sync all required values in one call
   Serial.println("Blynk connected and RTC synced");
   
   // Calculate initial next feed time
@@ -107,15 +114,21 @@ BLYNK_WRITE(V0) {
     // Record the feeding time
     lastFeedTime = getCurrentTimeInSeconds();
     updateNextFeedTime();
+    // Don't call updateStatus() directly - let the timer handle it
+    statusUpdateNeeded = true;
   }
 }
 
 // Adjust portion size slider
 BLYNK_WRITE(V1) {
-  feedingAmount = param.asInt() * 100;  // Scale slider value (0-10) to steps
+  feedingAmount = param.asInt() * 10;  // Scale slider value (0-10) to steps
   Serial.print("Feeding amount set to: ");
   Serial.println(feedingAmount);
-  Blynk.virtualWrite(V5, String("Portion: ") + String(param.asInt()));
+  
+  // Instead of immediately writing to Blynk
+  lastFedStatus = String("Portion: ") + String(param.asInt()) + 
+                  " (Last: " + getCurrentTime() + ")";
+  statusUpdateNeeded = true;
 }
 
 // Schedule enable/disable switch
@@ -123,92 +136,50 @@ BLYNK_WRITE(V4) {
   scheduleEnabled = param.asInt();
   Serial.print("Schedule enabled: ");
   Serial.println(scheduleEnabled);
-  updateStatus(); // Update status display when schedule is toggled
+  statusUpdateNeeded = true; // Flag for update rather than immediate update
 }
 
 // Set scheduled feeding times (V7, V8, V9, V10 for up to 4 feeding times)
-BLYNK_WRITE(V7) {
+// Optimized version for all time inputs to reduce code duplication
+void handleTimeInputChange(int scheduleIndex, const BlynkParam& param) {
   TimeInputParam t(param);
   if (t.hasStartTime()) {
     int hours = t.getStartHour();
     int minutes = t.getStartMinute();
-    scheduledFeedingTimes[0] = hours * 3600 + minutes * 60;
-    feedingTimeEnabled[0] = true;
-    Serial.print("Schedule 1 set to: ");
+    scheduledFeedingTimes[scheduleIndex] = hours * 3600 + minutes * 60;
+    feedingTimeEnabled[scheduleIndex] = true;
+    Serial.print("Schedule ");
+    Serial.print(scheduleIndex + 1);
+    Serial.print(" set to: ");
     Serial.print(hours);
     Serial.print(":");
     if (minutes < 10) Serial.print("0");
     Serial.println(minutes);
-    updateNextFeedTime();
-    updateStatus();
   } else {
-    feedingTimeEnabled[0] = false;
-    updateNextFeedTime();
-    updateStatus();
+    feedingTimeEnabled[scheduleIndex] = false;
+    Serial.print("Schedule ");
+    Serial.print(scheduleIndex + 1);
+    Serial.println(" disabled");
   }
+  
+  updateNextFeedTime();
+  statusUpdateNeeded = true; // Flag for update instead of direct call
+}
+
+BLYNK_WRITE(V7) {
+  handleTimeInputChange(0, param);
 }
 
 BLYNK_WRITE(V8) {
-  TimeInputParam t(param);
-  if (t.hasStartTime()) {
-    int hours = t.getStartHour();
-    int minutes = t.getStartMinute();
-    scheduledFeedingTimes[1] = hours * 3600 + minutes * 60;
-    feedingTimeEnabled[1] = true;
-    Serial.print("Schedule 2 set to: ");
-    Serial.print(hours);
-    Serial.print(":");
-    if (minutes < 10) Serial.print("0");
-    Serial.println(minutes);
-    updateNextFeedTime();
-    updateStatus();
-  } else {
-    feedingTimeEnabled[1] = false;
-    updateNextFeedTime();
-    updateStatus();
-  }
+  handleTimeInputChange(1, param);
 }
 
 BLYNK_WRITE(V9) {
-  TimeInputParam t(param);
-  if (t.hasStartTime()) {
-    int hours = t.getStartHour();
-    int minutes = t.getStartMinute();
-    scheduledFeedingTimes[2] = hours * 3600 + minutes * 60;
-    feedingTimeEnabled[2] = true;
-    Serial.print("Schedule 3 set to: ");
-    Serial.print(hours);
-    Serial.print(":");
-    if (minutes < 10) Serial.print("0");
-    Serial.println(minutes);
-    updateNextFeedTime();
-    updateStatus();
-  } else {
-    feedingTimeEnabled[2] = false;
-    updateNextFeedTime();
-    updateStatus();
-  }
+  handleTimeInputChange(2, param);
 }
 
 BLYNK_WRITE(V10) {
-  TimeInputParam t(param);
-  if (t.hasStartTime()) {
-    int hours = t.getStartHour();
-    int minutes = t.getStartMinute();
-    scheduledFeedingTimes[3] = hours * 3600 + minutes * 60;
-    feedingTimeEnabled[3] = true;
-    Serial.print("Schedule 4 set to: ");
-    Serial.print(hours);
-    Serial.print(":");
-    if (minutes < 10) Serial.print("0");
-    Serial.println(minutes);
-    updateNextFeedTime();
-    updateStatus();
-  } else {
-    feedingTimeEnabled[3] = false;
-    updateNextFeedTime();
-    updateStatus();
-  }
+  handleTimeInputChange(3, param);
 }
 
 void setup() {
@@ -296,11 +267,12 @@ void setup() {
       // Check for scheduled feedings every minute
       timer.setInterval(60000L, checkScheduledFeeding);
       
-      // Update status display every 5 seconds
-      timer.setInterval(5000L, updateStatus);
+      // Setup batched updates instead of frequent status updates
+      setupBatchedUpdates();
       
       Serial.println("Pet Feeder Ready!");
-      Blynk.virtualWrite(V5, "Pet Feeder Ready!");
+      lastFedStatus = "Pet Feeder Ready!";
+      statusUpdateNeeded = true;
     }
   }
 }
@@ -324,6 +296,7 @@ void loop() {
     // Normal operation mode
     Blynk.run();
     timer.run();
+    statusUpdateTimer.run(); // Run the batched status update timer
     
     // Check if config button is pressed during normal operation
     if (digitalRead(CONFIG_PIN) == LOW) {
@@ -360,7 +333,9 @@ void feedNow() {
   Serial.println("Starting feeding sequence");
   feedingInProgress = true;
   if (!configMode) {
-    Blynk.virtualWrite(V5, "Feeding in progress...");
+    // Instead of immediately writing to Blynk, just update local status
+    lastFedStatus = "Feeding in progress...";
+    statusUpdateNeeded = true;
   }
   
   // Enable stepper
@@ -407,14 +382,17 @@ void feedNow() {
   
   if (!configMode) {
     String lastFedTime = getCurrentTime();
-    Blynk.virtualWrite(V5, "Last fed: " + lastFedTime);
+    // Update local status instead of writing to Blynk immediately
+    lastFedStatus = "Last fed: " + lastFedTime;
     Serial.println("Feeding complete at " + lastFedTime);
     
     // Update the last feed time and calculate the next one
     lastFeedTime = getCurrentTimeInSeconds();
     lastFeedTimestamp = millis();  // Record when we last fed
     updateNextFeedTime();
-    updateStatus();
+    
+    // Flag that we need to update status
+    statusUpdateNeeded = true;
   } else {
     Serial.println("Feeding complete (config mode)");
   }
@@ -463,6 +441,9 @@ void updateNextFeedTime() {
   } else {
     Serial.println("No scheduled feeding times set.");
   }
+  
+  // Signal that status needs update
+  statusUpdateNeeded = true;
 }
 
 void checkScheduledFeeding() {
@@ -489,7 +470,6 @@ void checkScheduledFeeding() {
   // Calculate the current time period in minutes (for tracking feeding periods)
   unsigned long currentFeedingPeriod = (hour() * 60) + minute();
   
-  // Define a window of time when we consider it the "scheduled time"
   // Only dispense food if we're within 1 minute of the scheduled time
   bool isScheduledTimeWindow = false;
   
@@ -498,9 +478,7 @@ void checkScheduledFeeding() {
     isScheduledTimeWindow = true;
   }
   
-  // Only feed if:
-  // 1. We're in the scheduled time window AND
-  // 2. We haven't already fed during this specific minute of the day
+  
   if (isScheduledTimeWindow && lastFeedingPeriod != currentFeedingPeriod) {
     Serial.println("Scheduled feeding time reached!");
     Serial.print("Last feeding period: ");
@@ -516,27 +494,12 @@ void checkScheduledFeeding() {
     
     // Calculate the next feeding time
     updateNextFeedTime();
+    
+    // Status update is already flagged in feedNow()
   }
 }
 
-String getCurrentTime() {
-  char timeStr[10];
-  sprintf(timeStr, "%02d:%02d", hour(), minute());
-  return String(timeStr);
-}
-
-String formatTimeFromSeconds(unsigned long totalSeconds) {
-  int hours = totalSeconds / 3600;
-  int minutes = (totalSeconds % 3600) / 60;
-  char timeStr[10];
-  sprintf(timeStr, "%02d:%02d", hours, minutes);
-  return String(timeStr);
-}
-
-unsigned long getCurrentTimeInSeconds() {
-  return hour() * 3600 + minute() * 60 + second();
-}
-
+// Update status but only send to Blynk when needed
 void updateStatus() {
   if (configMode) return;
   
@@ -550,7 +513,7 @@ void updateStatus() {
   if (second() < 10) Serial.print("0");
   Serial.println(second());
   
-  // Update next feeding time on V2
+  // Prepare next feeding time status
   String nextFeeding = "Next: ";
   if (scheduleEnabled && activeScheduleCount > 0) {
     nextFeeding += formatTimeFromSeconds(nextFeedTime);
@@ -580,139 +543,271 @@ void updateStatus() {
     nextFeeding += "No times set";
   }
   
-  // Update status widgets
-  Blynk.virtualWrite(V2, nextFeeding);
+  // Update last fed status
+  String lastFed = String("Portion: ") + String(feedingAmount / 100) + 
+                   " (Last: " + getCurrentTime() + ")";
   
-  // Update V5 with current portion size and last fed time
-  Blynk.virtualWrite(V5, String("Portion: ") + String(feedingAmount / 100) + 
-                        " (Last: " + getCurrentTime() + ")");
-  
-  // Update V6 with active schedule count
+  // Update schedule status
   String scheduleStr = "Schedule: ";
   scheduleStr += String(activeScheduleCount) + " active times";
-  Blynk.virtualWrite(V6, scheduleStr);
+  
+  // Only update Blynk if values have changed
+  if (nextFeedingStatus != nextFeeding || 
+      lastFedStatus != lastFed || 
+      scheduleStatus != scheduleStr ||
+      statusUpdateNeeded) {
+      
+    // Now send all updates as a batch
+    Blynk.virtualWrite(V2, nextFeeding);
+    Blynk.virtualWrite(V5, lastFed);
+    Blynk.virtualWrite(V6, scheduleStr);
+    
+    // Save current status for comparison later
+    nextFeedingStatus = nextFeeding;
+    lastFedStatus = lastFed;
+    scheduleStatus = scheduleStr;
+    statusUpdateNeeded = false;
+    
+    Serial.println("Status updated to Blynk");
+  }
 }
 
-// SoftAP Configuration Functions
+// IMPLEMENTING MISSING FUNCTIONS
 
-void startConfigPortal() {
-  // Disconnect from current WiFi if connected
-  WiFi.disconnect();
+// Get current time as formatted string (HH:MM)
+String getCurrentTime() {
+  char timeStr[6]; // HH:MM\0
+  sprintf(timeStr, "%02d:%02d", hour(), minute());
+  return String(timeStr);
+}
+
+// Format seconds into time string
+String formatTimeFromSeconds(unsigned long seconds) {
+  int h = (seconds / 3600) % 24;
+  int m = (seconds % 3600) / 60;
   
-  // Create SoftAP
+  char timeStr[6]; // HH:MM\0
+  sprintf(timeStr, "%02d:%02d", h, m);
+  return String(timeStr);
+}
+
+// Get current time in seconds since midnight
+unsigned long getCurrentTimeInSeconds() {
+  return hour() * 3600 + minute() * 60 + second();
+}
+
+// Setup batched updates to reduce Blynk traffic
+void setupBatchedUpdates() {
+  // Update status every 10 seconds if needed
+  statusUpdateTimer.setInterval(10000L, sendBatchedStatusUpdate);
+}
+
+// Send batched status update if needed
+void sendBatchedStatusUpdate() {
+  if (statusUpdateNeeded) {
+    updateStatus();
+  }
+}
+
+// WiFi Configuration Functions
+bool tryConnect() {
+  Serial.print("Connecting to WiFi: ");
+  Serial.println(ssid);
+  
+  // Connect with a timeout
+  WiFi.begin(ssid, pass);
+  
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("");
+    Serial.println("WiFi connected");
+    Serial.print("IP address: ");
+    Serial.println(WiFi.localIP());
+    return true;
+  } else {
+    Serial.println("");
+    Serial.println("WiFi connection failed");
+    return false;
+  }
+}
+
+// Load WiFi credentials from EEPROM
+void loadCredentials() {
+  Serial.println("Loading credentials from EEPROM");
+  
+  // Check if EEPROM has valid data
+  if (EEPROM.read(EEPROM_VALID_ADDR) != 1) {
+    Serial.println("No valid credentials in EEPROM");
+    return;
+  }
+  
+  // Read SSID
+  for (int i = 0; i < 32; i++) {
+    ssid[i] = char(EEPROM.read(EEPROM_SSID_ADDR + i));
+  }
+  
+  // Read password
+  for (int i = 0; i < 32; i++) {
+    pass[i] = char(EEPROM.read(EEPROM_PASS_ADDR + i));
+  }
+  
+  Serial.print("SSID loaded: ");
+  Serial.println(ssid);
+  Serial.println("Password loaded: [HIDDEN]");
+}
+
+// Save WiFi credentials to EEPROM
+void saveCredentials() {
+  Serial.println("Saving credentials to EEPROM");
+  
+  // Save SSID
+  for (int i = 0; i < 32; i++) {
+    EEPROM.write(EEPROM_SSID_ADDR + i, ssid[i]);
+  }
+  
+  // Save password
+  for (int i = 0; i < 32; i++) {
+    EEPROM.write(EEPROM_PASS_ADDR + i, pass[i]);
+  }
+  
+  // Mark as valid
+  EEPROM.write(EEPROM_VALID_ADDR, 1);
+  
+  EEPROM.commit();
+  Serial.println("Credentials saved");
+}
+
+// Configuration Portal Functions
+void startConfigPortal() {
+  Serial.println("Starting configuration portal");
+  
+  // Set mode and stop any existing connections
   WiFi.mode(WIFI_AP);
+  WiFi.softAPConfig(IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1), IPAddress(255, 255, 255, 0));
   WiFi.softAP(apSSID, apPassword);
   
-  IPAddress myIP = WiFi.softAPIP();
   Serial.print("AP IP address: ");
-  Serial.println(myIP);
+  Serial.println(WiFi.softAPIP());
   
-  // Setup the DNS server redirecting all domains to the AP IP
-  dnsServer.setErrorReplyCode(DNSReplyCode::NoError);
-  dnsServer.start(53, "*", myIP);
+  // Setup DNS server
+  dnsServer.start(53, "*", WiFi.softAPIP());
   
   // Set up web server handlers
   webServer.on("/", handleRoot);
   webServer.on("/save", handleSave);
-  webServer.on("/feed", HTTP_POST, handleFeed); // Add the handler
+  webServer.on("/feed", handleFeed);
   webServer.onNotFound(handleNotFound);
   webServer.begin();
   
-  // Set config mode flag and timeout
+  Serial.println("Web server started");
+  
+  // Set config mode and timeout
   configMode = true;
   configTimeout = CONFIG_TIMEOUT_MAX;
-  
-  Serial.println("Configuration portal started");
 }
 
+// Config Portal Web Server Handlers
 void handleRoot() {
-  String html = "<!DOCTYPE html><html><head>";
+  Serial.println("Web client connected to root page");
+  
+  String html = "<html><head><title>Pet Feeder Setup</title>";
   html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
-  html += "<title>Pet Feeder Setup</title>";
   html += "<style>";
-  html += "body{font-family:Arial,sans-serif;margin:0;padding:20px;text-align:center;background-color:#f8f9fa;}";
-  html += ".container{max-width:400px;margin:0 auto;background-color:white;padding:20px;border-radius:10px;box-shadow:0 4px 6px rgba(0,0,0,0.1);}";
-  html += "h1{color:#4CAF50;}";
-  html += "input[type=text],input[type=password]{width:100%;padding:12px 20px;margin:8px 0;display:inline-block;border:1px solid #ccc;";
-  html += "border-radius:4px;box-sizing:border-box;}";
-  html += "button{background-color:#4CAF50;color:white;padding:14px 20px;margin:8px 0;border:none;cursor:pointer;width:100%;border-radius:4px;}";
-  html += "button:hover{opacity:0.8;}";
-  html += ".test-feed{background-color:#2196F3;}";
-  html += "</style>";
-  html += "</head><body><div class='container'>";
+  html += "body { font-family: Arial, sans-serif; margin: 20px; }";
+  html += "input, button { margin: 10px 0; padding: 10px; width: 100%; }";
+  html += "h1 { color: #2c3e50; }";
+  html += "button { background-color: #3498db; color: white; border: none; cursor: pointer; }";
+  html += "button:hover { background-color: #2980b9; }";
+  html += ".container { max-width: 400px; margin: 0 auto; }";
+  html += "</style></head><body>";
+  html += "<div class='container'>";
   html += "<h1>Pet Feeder WiFi Setup</h1>";
-  html += "<form action='/save' method='post'>";
-  html += "<label for='ssid'><b>WiFi Name (SSID)</b></label>";
-  html += "<input type='text' name='ssid' id='ssid' value='" + String(ssid) + "' required>";
-  html += "<label for='password'><b>WiFi Password</b></label>";
-  html += "<input type='password' name='password' id='password' value='" + String(pass) + "' required>";
-  html += "<button type='submit'>Save Configuration</button>";
+  html += "<form action='/save' method='POST'>";
+  html += "WiFi Network Name:<br>";
+  html += "<input type='text' name='ssid' value='" + String(ssid) + "'><br>";
+  html += "WiFi Password:<br>";
+  html += "<input type='password' name='pass' value='" + String(pass) + "'><br>";
+  html += "<button type='submit'>Save & Connect</button>";
   html += "</form>";
-  html += "<button class='test-feed' onclick='testFeed()'>Test Feed Now</button>";
-  html += "<p>Device will restart after saving configuration.</p>";
-  html += "</div>";
-  html += "<script>";
-  html += "function testFeed() {";
-  html += "  fetch('/feed', {method: 'POST'}).then(response => {";
-  html += "    alert('Test feeding initiated!');";
-  html += "  });";
-  html += "}";
-  html += "</script>";
-  html += "</body></html>";
+  html += "<hr>";
+  html += "<h2>Test Feeder</h2>";
+  html += "<p>Press the button to test the feeding mechanism</p>";
+  html += "<button onclick='window.location=\"/feed\"'>Test Feed Now</button>";
+  html += "</div></body></html>";
   
   webServer.send(200, "text/html", html);
 }
 
 void handleSave() {
-  if (webServer.method() != HTTP_POST) {
-    webServer.send(405, "text/plain", "Method Not Allowed");
-    return;
+  Serial.println("Processing save request");
+  
+  if (webServer.hasArg("ssid") && webServer.hasArg("pass")) {
+    String newSSID = webServer.arg("ssid");
+    String newPass = webServer.arg("pass");
+    
+    Serial.print("New SSID: ");
+    Serial.println(newSSID);
+    Serial.println("New Password: [HIDDEN]");
+    
+    // Copy new values to our global variables
+    strncpy(ssid, newSSID.c_str(), sizeof(ssid) - 1);
+    strncpy(pass, newPass.c_str(), sizeof(pass) - 1);
+    
+    // Save to EEPROM
+    saveCredentials();
+    
+    // Send response
+    String html = "<html><head><title>Saved</title>";
+    html += "<meta http-equiv='refresh' content='5;url=/' />";
+    html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+    html += "<style>body { font-family: Arial, sans-serif; margin: 20px; text-align: center; }</style>";
+    html += "</head><body>";
+    html += "<h1>Settings Saved!</h1>";
+    html += "<p>Your settings have been saved. The device will attempt to connect...</p>";
+    html += "<p>Redirecting in 5 seconds...</p>";
+    html += "</body></html>";
+    webServer.send(200, "text/html", html);
+    
+    delay(1000);
+    
+    // Try to connect with new credentials
+    if (tryConnect()) {
+      // If successful, restart to apply
+      delay(1000);
+      ESP.restart();
+    }
+  } else {
+    webServer.send(400, "text/plain", "Missing Parameters");
   }
-  
-  String newSSID = webServer.arg("ssid");
-  String newPass = webServer.arg("password");
-  
-  // Validate inputs
-  if (newSSID.length() == 0) {
-    webServer.send(400, "text/plain", "SSID cannot be empty");
-    return;
-  }
-  
-  // Copy to global variables (with length checks)
-  strncpy(ssid, newSSID.c_str(), sizeof(ssid) - 1);
-  ssid[sizeof(ssid) - 1] = '\0'; // Ensure null termination
-  
-  strncpy(pass, newPass.c_str(), sizeof(pass) - 1);
-  pass[sizeof(pass) - 1] = '\0'; // Ensure null termination
-  
-  // Save to EEPROM
-  saveCredentials();
-  
-  // Send success response
-  String html = "<!DOCTYPE html><html><head>";
-  html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
-  html += "<title>Pet Feeder Setup Complete</title>";
-  html += "<style>";
-  html += "body{font-family:Arial,sans-serif;margin:0;padding:20px;text-align:center;background-color:#f8f9fa;}";
-  html += ".container{max-width:400px;margin:0 auto;background-color:white;padding:20px;border-radius:10px;box-shadow:0 4px 6px rgba(0,0,0,0.1);}";
-  html += "h1{color:#4CAF50;}";
-  html += "</style>";
-  html += "<meta http-equiv='refresh' content='5;url=/'>";
-  html += "</head><body><div class='container'>";
-  html += "<h1>Settings Saved</h1>";
-  html += "<p>WiFi credentials have been saved. The device will restart in 5 seconds.</p>";
-  html += "</div></body></html>";
-  
-  webServer.send(200, "text/html", html);
-  
-  // Set a timer to restart the ESP
-  Serial.println("Configuration saved, restarting in 5 seconds...");
-  delay(5000);
-  ESP.restart();
 }
 
-// Captive portal handler
+void handleFeed() {
+  Serial.println("Test feeding requested from web portal");
+  
+  // Trigger a feeding cycle
+  feedNow();
+  
+  // Send response
+  String html = "<html><head><title>Test Feed</title>";
+  html += "<meta http-equiv='refresh' content='5;url=/' />";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+  html += "<style>body { font-family: Arial, sans-serif; margin: 20px; text-align: center; }</style>";
+  html += "</head><body>";
+  html += "<h1>Test Feed Completed</h1>";
+  html += "<p>The feeder mechanism has been tested.</p>";
+  html += "<p>Redirecting in 5 seconds...</p>";
+  html += "</body></html>";
+  webServer.send(200, "text/html", html);
+}
+
 void handleNotFound() {
+  // If in AP mode, redirect to captive portal
   if (captivePortal()) {
     return;
   }
@@ -725,99 +820,45 @@ void handleNotFound() {
   message += "\nArguments: ";
   message += webServer.args();
   message += "\n";
+  
   for (uint8_t i = 0; i < webServer.args(); i++) {
     message += " " + webServer.argName(i) + ": " + webServer.arg(i) + "\n";
   }
+  
   webServer.send(404, "text/plain", message);
 }
 
-// Special handler for the test feed function
-void handleFeed() {
-  feedNow();
-  webServer.send(200, "text/plain", "Feeding initiated");
-}
-
-// Helper function for captive portal
+// Handle captive portal requests by redirecting to our setup page
 bool captivePortal() {
-  if (webServer.hostHeader() != WiFi.softAPIP().toString()) {
-    webServer.sendHeader("Location", String("http://") + WiFi.softAPIP().toString(), true);
+  if (!isIP(webServer.hostHeader()) && webServer.hostHeader() != (String(apSSID) + ".local")) {
+    Serial.print("Redirecting client to captive portal: ");
+    Serial.println(webServer.hostHeader());
+    
+    webServer.sendHeader("Location", String("http://") + toStringIP(webServer.client().localIP()), true);
     webServer.send(302, "text/plain", "");
+    webServer.client().stop();
     return true;
   }
   return false;
 }
 
-// WiFi connection function
-bool tryConnect() {
-  Serial.println("Attempting to connect to WiFi...");
-  Serial.print("SSID: ");
-  Serial.println(ssid);
-  
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(ssid, pass);
-  
-  int attempt = 0;
-  while (WiFi.status() != WL_CONNECTED && attempt < 20) { // 10 second timeout
-    delay(500);
-    Serial.print(".");
-    attempt++;
+// Helper function to determine if a string is an IP address
+bool isIP(String str) {
+  for (uint8_t i = 0; i < str.length(); i++) {
+    char c = str.charAt(i);
+    if (c != '.' && c != ':' && (c < '0' || c > '9')) {
+      return false;
+    }
   }
-  Serial.println();
-  
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.print("Connected, IP address: ");
-    Serial.println(WiFi.localIP());
-    return true;
-  } else {
-    Serial.println("Failed to connect to WiFi");
-    return false;
-  }
+  return true;
 }
 
-// EEPROM Functions
-void loadCredentials() {
-  // Check if we have valid credentials stored
-  if (EEPROM.read(EEPROM_VALID_ADDR) == 1) {
-    // Read SSID
-    for (int i = 0; i < 32; i++) {
-      ssid[i] = char(EEPROM.read(EEPROM_SSID_ADDR + i));
-    }
-    ssid[31] = '\0'; // Ensure null termination
-    
-    // Read password
-    for (int i = 0; i < 32; i++) {
-      pass[i] = char(EEPROM.read(EEPROM_PASS_ADDR + i));
-    }
-    pass[31] = '\0'; // Ensure null termination
-    
-    Serial.println("Loaded WiFi credentials from EEPROM");
-    Serial.print("SSID: ");
-    Serial.println(ssid);
-    Serial.print("Password: ");
-    Serial.print("********"); // Don't print actual password
-  } else {
-    Serial.println("No valid credentials found in EEPROM");
+// Helper function to convert IP to string
+String toStringIP(IPAddress ip) {
+  String res = "";
+  for (int i = 0; i < 3; i++) {
+    res += String((ip >> (8 * i)) & 0xFF) + ".";
   }
-}
-
-void saveCredentials() {
-  // Write SSID
-  for (int i = 0; i < strlen(ssid); i++) {
-    EEPROM.write(EEPROM_SSID_ADDR + i, ssid[i]);
-  }
-  // Null-terminate
-  EEPROM.write(EEPROM_SSID_ADDR + strlen(ssid), 0);
-  
-  // Write password
-  for (int i = 0; i < strlen(pass); i++) {
-    EEPROM.write(EEPROM_PASS_ADDR + i, pass[i]);
-  }
-  // Null-terminate
-  EEPROM.write(EEPROM_PASS_ADDR + strlen(pass), 0);
-  
-  // Mark as valid
-  EEPROM.write(EEPROM_VALID_ADDR, 1);
-  
-  EEPROM.commit();
-  Serial.println("Saved WiFi credentials to EEPROM");
+  res += String(((ip >> 8 * 3)) & 0xFF);
+  return res;
 }
